@@ -11,17 +11,12 @@ def interleave_rollout(state: vf.State) -> list[TrainingExample]:
     Convert vf.State to a *single* trainable rollout by interleaving the trajectory.
 
     For multi-turn conversations, this function uses prompt_logprobs from the final turn
-    to ensure correct importance ratio computation. This fixes the re-tokenization issue
-    where past assistant tokens may have different IDs when re-tokenized.
-
-    The key insight: The final turn's prompt_ids and prompt_logprobs are aligned because
-    they come from the same vLLM tokenization run. Using these for past turns ensures
-    the importance ratio is computed correctly.
+    to ensure correct importance ratio computation.
     """
     logger = get_logger()
     trajectory = state["trajectory"]
 
-    # Single-turn case: use original behavior (no re-tokenization issue)
+    # Single-turn case: use original behavior 
     if len(trajectory) == 1:
         first_step = trajectory[0]
         return [
@@ -41,13 +36,13 @@ def interleave_rollout(state: vf.State) -> list[TrainingExample]:
     final_tokens = final_step["tokens"]
     assert final_tokens is not None
 
-    # Get the final turn's data (aligned tokenization)
+    # Get the final turn's data 
     final_prompt_ids = final_tokens["prompt_ids"]
     final_prompt_logprobs = final_tokens.get("prompt_logprobs")
     final_completion_ids = final_tokens["completion_ids"]
     final_completion_logprobs = final_tokens["completion_logprobs"]
 
-    # First turn's prompt length (this is the "original" prompt before any completions)
+    # First turn's prompt length 
     first_prompt_len = len(first_step["tokens"]["prompt_ids"])
 
     # Fall back to legacy behavior if prompt_logprobs not available
