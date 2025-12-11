@@ -37,6 +37,7 @@ def get_sampling_args(sampling_config: SamplingConfig) -> dict:
         **sampling_config.extra_body,
         "return_token_ids": True,  # Always return token IDs
         "prompt_logprobs": True,  # Always return prompt logprobs
+        "return_routing": True,  # Request MoE expert routing metadata
         "top_k": -1,
         "min_p": 0.0,
     }

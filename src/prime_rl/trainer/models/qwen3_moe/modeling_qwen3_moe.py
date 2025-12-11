@@ -95,6 +95,8 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.LongTensor | None = None,
         max_seqlen: int | None = None,
+        moe_routing_override: dict[str, torch.Tensor] | None = None,
+        return_router_logprobs: bool = False,
     ) -> torch.FloatTensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -110,8 +112,19 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        router_logprobs = None
+        if isinstance(self.mlp, MoE):
+            if return_router_logprobs:
+                hidden_states, router_logprobs = self.mlp(
+                    hidden_states, routing_override=moe_routing_override, return_router_logprobs=True
+                )
+            else:
+                hidden_states = self.mlp(hidden_states, routing_override=moe_routing_override)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        if return_router_logprobs:
+            return hidden_states, router_logprobs
         return hidden_states
 
 
@@ -200,6 +213,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        moe_routing_overrides: Optional[dict[int, dict[str, torch.Tensor]]] = None,
+        return_router_logprobs: bool = False,
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -226,17 +241,36 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
-                hidden_states,
-                position_embeddings=position_embeddings,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-            )
+        router_logprobs_layers: list[torch.Tensor] = []
+        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            override = moe_routing_overrides.get(layer_idx) if moe_routing_overrides is not None else None
+            if return_router_logprobs:
+                hidden_states, router_lp = decoder_layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    moe_routing_override=override,
+                    return_router_logprobs=True,
+                )
+                if router_lp is not None:
+                    router_logprobs_layers.append(router_lp)
+            else:
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    moe_routing_override=override,
+                    return_router_logprobs=False,
+                )
 
         hidden_states = self.norm(hidden_states)
 
-        return MoeModelOutputWithPast(last_hidden_state=hidden_states)
+        output = MoeModelOutputWithPast(last_hidden_state=hidden_states)
+        if return_router_logprobs:
+            return output, router_logprobs_layers
+        return output
 
 
 def load_balancing_loss_func(
@@ -395,12 +429,20 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             else:
                 position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
 
+        moe_routing_overrides = kwargs.pop("moe_routing_overrides", None)
+        return_router_logprobs = kwargs.pop("return_router_logprobs", False)
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: MoeModelOutputWithPast = self.model(
+        outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            moe_routing_overrides=moe_routing_overrides,
+            return_router_logprobs=return_router_logprobs,
         )
+        router_logprobs_layers = None
+        if return_router_logprobs:
+            outputs, router_logprobs_layers = outputs
 
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
@@ -422,7 +464,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
-        return MoeCausalLMOutputWithPast(
+        lm_output = MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -431,6 +473,9 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
         )
+        if return_router_logprobs:
+            return lm_output, router_logprobs_layers
+        return lm_output
 
     def init_buffers_post_meta(self):
         buffer_names = [name for name, _ in self.named_buffers()]

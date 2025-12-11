@@ -12,6 +12,11 @@ class TrainingExample(TypedDict):
     completion_ids: list[int]
     completion_mask: list[int]
     completion_logprobs: list[float]
+    # Optional MoE routing metadata for routing replay.
+    prompt_expert_indices: list | None
+    prompt_expert_probs: list | None
+    completion_expert_indices: list | None
+    completion_expert_probs: list | None
     advantage: float | None
 
 
@@ -24,3 +29,4 @@ class TensorTrainingExample(TypedDict):
     loss_mask: Bool[Tensor, "seq"]
     advantages: Float[Tensor, "seq"]
     inference_logprobs: Float[Tensor, "seq"]
+    moe_routing_overrides: dict[int, dict[str, Tensor]] | None

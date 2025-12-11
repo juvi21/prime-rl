@@ -346,6 +346,24 @@ def setup_model(config: ModelConfig, parallel_dims: ParallelDims) -> nn.Module:
 
 @jaxtyped(typechecker=typechecker)
 def forward(
-    model: nn.Module, input_ids: Int[Tensor, "batch seq"], position_ids: Int[Tensor, "batch seq"]
-) -> Float[Tensor, "batch seq vocab"]:
-    return model(input_ids=input_ids, position_ids=position_ids).logits
+    model: nn.Module,
+    input_ids: Int[Tensor, "batch seq"],
+    position_ids: Int[Tensor, "batch seq"],
+    moe_routing_overrides: dict[int, dict[str, Tensor]] | None = None,
+    return_router_logprobs: bool = False,
+):
+    """Forward pass with optional MoE routing replay.
+
+    If return_router_logprobs is True, models that support routing replay
+    return a (output, router_logprobs_layers) tuple.
+    """
+    outputs = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        moe_routing_overrides=moe_routing_overrides,
+        return_router_logprobs=return_router_logprobs,
+    )
+    router_logprobs_layers = None
+    if return_router_logprobs:
+        outputs, router_logprobs_layers = outputs
+    return outputs.logits, router_logprobs_layers

@@ -17,6 +17,7 @@ class MicroBatch(TypedDict):
     advantages: Float[Tensor, "batch seq"]
     inference_logprobs: Float[Tensor, "batch seq"]
     loss_mask: Bool[Tensor, "batch seq"]
+    moe_routing_overrides: dict[int, dict[str, Tensor]] | None
 
     # Batch level
     temperature: float
@@ -49,6 +50,7 @@ class FakeDataLoader:
             "inference_logprobs": torch.randn(self.seq_len).unsqueeze(0),
             "temperature": 1.0,
             "loss_mask": torch.ones(self.seq_len, dtype=torch.bool).unsqueeze(0),
+            "moe_routing_overrides": None,
         }
 
 

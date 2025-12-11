@@ -32,12 +32,43 @@ def prepare_sample(
     advantages = torch.tensor(training_example["advantage"]).repeat(len(input_ids)).float()
     position_ids = torch.arange(len(input_ids)).long()
 
+    # Prepare MoE routing overrides if present.
+    moe_routing_overrides = None
+    prompt_expert_indices = training_example.get("prompt_expert_indices")
+    prompt_expert_probs = training_example.get("prompt_expert_probs")
+    completion_expert_indices = training_example.get("completion_expert_indices")
+    completion_expert_probs = training_example.get("completion_expert_probs")
+    if (
+        prompt_expert_indices is not None
+        and prompt_expert_probs is not None
+        and completion_expert_indices is not None
+        and completion_expert_probs is not None
+    ):
+        expert_indices_full = prompt_expert_indices + completion_expert_indices
+        expert_probs_full = prompt_expert_probs + completion_expert_probs
+        if len(expert_indices_full) == len(input_ids):
+            num_layers = len(expert_indices_full[0])
+            moe_routing_overrides = {}
+            for layer_idx in range(num_layers):
+                indices_layer = [tok[layer_idx] for tok in expert_indices_full]
+                probs_layer = [tok[layer_idx] for tok in expert_probs_full]
+                moe_routing_overrides[layer_idx] = {
+                    "indices": torch.tensor(indices_layer, dtype=torch.int64),
+                    "probs": torch.tensor(probs_layer, dtype=torch.float32),
+                }
+
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
         loss_mask = loss_mask[:seq_len]
         inference_logprobs = inference_logprobs[:seq_len]
         position_ids = position_ids[:seq_len]
         advantages = advantages[:seq_len]
+        if moe_routing_overrides is not None:
+            for layer_idx, override in moe_routing_overrides.items():
+                moe_routing_overrides[layer_idx] = {
+                    "indices": override["indices"][:seq_len],
+                    "probs": override["probs"][:seq_len],
+                }
 
     assert len(input_ids) == len(advantages) == len(loss_mask) == len(position_ids) == len(inference_logprobs), (
         f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}"
@@ -48,6 +79,7 @@ def prepare_sample(
         loss_mask=loss_mask,
         position_ids=position_ids,
         inference_logprobs=inference_logprobs,
+        moe_routing_overrides=moe_routing_overrides,
     )
 
 
@@ -56,6 +88,19 @@ def prepare_micro_batch(samples: list[MicroBatch], temperature: float):
 
     for key in ["input_ids", "advantages", "loss_mask", "inference_logprobs", "position_ids"]:
         micro_batch[key] = torch.stack([sample[key] for sample in samples], dim=0)
+
+    # Stack MoE routing overrides if present for all samples.
+    overrides = [sample.get("moe_routing_overrides") for sample in samples]
+    if all(o is not None for o in overrides):
+        combined: dict[int, dict[str, torch.Tensor]] = {}
+        for layer_idx in overrides[0].keys():  # type: ignore
+            combined[layer_idx] = {
+                "indices": torch.stack([o[layer_idx]["indices"] for o in overrides], dim=0),  # type: ignore
+                "probs": torch.stack([o[layer_idx]["probs"] for o in overrides], dim=0),  # type: ignore
+            }
+        micro_batch["moe_routing_overrides"] = combined
+    else:
+        micro_batch["moe_routing_overrides"] = None
 
     micro_batch["temperature"] = temperature
 
@@ -107,6 +152,19 @@ def prepare_micro_batch_packing(
 
     for key in ["input_ids", "advantages", "loss_mask", "position_ids", "inference_logprobs"]:
         micro_batch[key] = torch.cat([sample[key] for sample in samples], dim=0).unsqueeze(0)
+
+    # Concatenate MoE routing overrides if present.
+    overrides_list = [sample.get("moe_routing_overrides") for sample in samples]
+    if all(o is not None for o in overrides_list):
+        combined: dict[int, dict[str, torch.Tensor]] = {}
+        for layer_idx in overrides_list[0].keys():  # type: ignore
+            combined[layer_idx] = {
+                "indices": torch.cat([o[layer_idx]["indices"] for o in overrides_list], dim=0).unsqueeze(0),  # type: ignore
+                "probs": torch.cat([o[layer_idx]["probs"] for o in overrides_list], dim=0).unsqueeze(0),  # type: ignore
+            }
+        micro_batch["moe_routing_overrides"] = combined
+    else:
+        micro_batch["moe_routing_overrides"] = None
 
     micro_batch["temperature"] = temperature
 

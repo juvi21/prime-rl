@@ -4,6 +4,7 @@ import time
 
 from prime_rl.orchestrator.advantage import compute_advantages
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
+from prime_rl.orchestrator.routing import attach_routing_to_state
 from prime_rl.orchestrator.trajectories import branch_rollout, interleave_rollout
 from prime_rl.orchestrator.types import TrainingExample
 
@@ -267,6 +268,10 @@ async def orchestrate(config: OrchestratorConfig):
         await train_task
         generate_completions_time = time.perf_counter() - generate_completions_start_time
         train_rollouts = train_task.result()
+
+        # Attach MoE routing metadata (if provided by inference).
+        for rollout in train_rollouts:
+            attach_routing_to_state(rollout)
 
         # Compute advantages
         rewards = [rollout["reward"] for rollout in train_rollouts]

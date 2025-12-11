@@ -28,6 +28,10 @@ $$
 
 where $\mu$ refers to the policy that generated the rollout, $\pi$ refers to the current policy, $\hat{A}_{i,t}$ is the token-level advantage, and $\delta$ is the importance sampling clipping ratio.
 
+### MoE Routing Replay + Router IS
+
+For MoE policies, PRIME‑RL can replay the experts used during inference and apply a router importance‑sampling term (RSPO‑style). This requires the inference backend (vLLM) to return per‑token expert indices and router probabilities via `extra_body.return_routing=true`. The orchestrator stores these as `moe_routing_overrides` in rollout `.pt` files, and the trainer adds the router log‑ratio to the usual token log‑ratio.
+
 
 ## Step Semantics
 

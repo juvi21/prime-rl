@@ -219,16 +219,7 @@ class TokenChoiceTopKRouter(nn.Module):
                 - num_tokens_per_expert (torch.Tensor):
                     Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
-        # scores shape (bs*slen, num_experts)
-        scores = self.gate(x)
-
-        # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
-        if self.score_func == "sigmoid":
-            scores = torch.sigmoid(scores.to(torch.float32))
-        elif self.score_func == "softmax":
-            scores = F.softmax(scores.to(torch.float32), dim=1)
-        else:
-            raise NotImplementedError(f"Unknown score function {self.score_func}")
+        scores = self.compute_scores(x)
 
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
@@ -253,6 +244,22 @@ class TokenChoiceTopKRouter(nn.Module):
         )
 
         return top_scores, selected_experts_indices, num_tokens_per_expert
+
+    def compute_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute full router probabilities over experts.
+
+        Returns:
+            scores: Tensor of shape (bs*slen, num_experts) with probabilities.
+        """
+        scores = self.gate(x)
+        # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
+        if self.score_func == "sigmoid":
+            scores = torch.sigmoid(scores.to(torch.float32))
+        elif self.score_func == "softmax":
+            scores = F.softmax(scores.to(torch.float32), dim=1)
+        else:
+            raise NotImplementedError(f"Unknown score function {self.score_func}")
+        return scores
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
@@ -370,24 +377,59 @@ class MoE(nn.Module):
             persistent=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        routing_override: dict[str, torch.Tensor] | None = None,
+        return_router_logprobs: bool = False,
+    ):
         """
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
+            routing_override (dict | None): Optional override for routing replay.
+                Expected keys:
+                    - "indices": Int tensor of shape (bs, slen, top_k) or (bs*slen, top_k)
+                    - "probs": Float tensor of shape (bs, slen, top_k) or (bs*slen, top_k)
+                If provided, the layer will route using these experts/weights.
+            return_router_logprobs (bool): If True, also return current-policy
+                router log-probabilities of the (replayed) experts.
 
         Returns:
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
+            router_logprobs (torch.Tensor, optional): Tensor of shape (bs, slen)
+                with summed log-prob over top_k experts under current router.
         """
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
 
-        # top_scores and selected_experts_indices shape (bs*slen*top_k,)
-        # num_tokens_per_expert shape (num_experts,)
-        (
-            top_scores,
-            selected_experts_indices,
-            num_tokens_per_expert,
-        ) = self.router(x, self.expert_bias)
+        scores = self.router.compute_scores(x)
+
+        if routing_override is None:
+            (
+                top_scores,
+                selected_experts_indices,
+                num_tokens_per_expert,
+            ) = self.router(x, self.expert_bias)
+        else:
+            selected_experts_indices = routing_override["indices"]
+            top_scores = routing_override["probs"]
+            if selected_experts_indices.dim() == 3:
+                selected_experts_indices = selected_experts_indices.view(-1, selected_experts_indices.shape[-1])
+            if top_scores.dim() == 3:
+                top_scores = top_scores.view(-1, top_scores.shape[-1])
+            num_tokens_per_expert = torch.histc(
+                selected_experts_indices.view(-1),
+                bins=self.experts.num_experts,
+                min=0,
+                max=self.experts.num_experts,
+            )
+
+        # Router log-probabilities for IS (current policy).
+        router_logprobs = None
+        if return_router_logprobs:
+            # Gather current router probabilities for the selected experts.
+            current_probs = scores.gather(dim=1, index=selected_experts_indices)
+            router_logprobs = torch.log(current_probs + 1e-20).sum(dim=-1).view(bs, slen)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage
@@ -434,6 +476,8 @@ class MoE(nn.Module):
 
         out = out.scatter_add(dim=0, index=token_indices_experts_sorted, src=routed_output)
         out = out.reshape(bs, slen, dim)
+        if return_router_logprobs:
+            return out, router_logprobs
         return out
 
     def init_weights(

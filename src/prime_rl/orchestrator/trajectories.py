@@ -25,6 +25,10 @@ def interleave_rollout(state: vf.State) -> list[TrainingExample]:
         completion_ids=deepcopy(first_step["tokens"]["completion_ids"]),
         completion_mask=deepcopy(first_step["tokens"]["completion_mask"]),
         completion_logprobs=deepcopy(first_step["tokens"]["completion_logprobs"]),
+        prompt_expert_indices=deepcopy(first_step["tokens"].get("prompt_expert_indices")),
+        prompt_expert_probs=deepcopy(first_step["tokens"].get("prompt_expert_probs")),
+        completion_expert_indices=deepcopy(first_step["tokens"].get("completion_expert_indices")),
+        completion_expert_probs=deepcopy(first_step["tokens"].get("completion_expert_probs")),
         advantage=None,
     )
 
@@ -46,6 +50,17 @@ def interleave_rollout(state: vf.State) -> list[TrainingExample]:
         interleaved_rollout["completion_ids"].extend(prompt_ids)
         interleaved_rollout["completion_mask"].extend([0] * len(prompt_ids))
         interleaved_rollout["completion_logprobs"].extend([0.0] * len(prompt_ids))
+        if interleaved_rollout.get("completion_expert_indices") is not None:
+            step_prompt_expert_indices = tokens.get("prompt_expert_indices")
+            step_prompt_expert_probs = tokens.get("prompt_expert_probs")
+            if step_prompt_expert_indices is None or step_prompt_expert_probs is None:
+                interleaved_rollout["completion_expert_indices"] = None
+                interleaved_rollout["completion_expert_probs"] = None
+            else:
+                new_prompt_expert_indices = deepcopy(step_prompt_expert_indices[len(prefix_tokens) :])
+                new_prompt_expert_probs = deepcopy(step_prompt_expert_probs[len(prefix_tokens) :])
+                interleaved_rollout["completion_expert_indices"].extend(new_prompt_expert_indices)
+                interleaved_rollout["completion_expert_probs"].extend(new_prompt_expert_probs)
 
         # Extend the completion with the new completion tokens
         completion_ids = deepcopy(tokens["completion_ids"])
@@ -53,6 +68,19 @@ def interleave_rollout(state: vf.State) -> list[TrainingExample]:
         interleaved_rollout["completion_ids"].extend(completion_ids)
         interleaved_rollout["completion_mask"].extend([1] * len(completion_ids))
         interleaved_rollout["completion_logprobs"].extend(completion_logprobs)
+        if interleaved_rollout.get("completion_expert_indices") is not None:
+            step_completion_expert_indices = tokens.get("completion_expert_indices")
+            step_completion_expert_probs = tokens.get("completion_expert_probs")
+            if step_completion_expert_indices is None or step_completion_expert_probs is None:
+                interleaved_rollout["completion_expert_indices"] = None
+                interleaved_rollout["completion_expert_probs"] = None
+            else:
+                interleaved_rollout["completion_expert_indices"].extend(
+                    deepcopy(step_completion_expert_indices)
+                )
+                interleaved_rollout["completion_expert_probs"].extend(
+                    deepcopy(step_completion_expert_probs)
+                )
 
         # New prefix is the the current prompt and completion ids concatenated
         prefix_tokens = tokens["prompt_ids"] + tokens["completion_ids"]
@@ -72,6 +100,10 @@ def branch_rollout(state: vf.State) -> list[TrainingExample]:
             completion_ids=deepcopy(tokens["completion_ids"]),
             completion_mask=deepcopy(tokens["completion_mask"]),
             completion_logprobs=deepcopy(tokens["completion_logprobs"]),
+            prompt_expert_indices=deepcopy(tokens.get("prompt_expert_indices")),
+            prompt_expert_probs=deepcopy(tokens.get("prompt_expert_probs")),
+            completion_expert_indices=deepcopy(tokens.get("completion_expert_indices")),
+            completion_expert_probs=deepcopy(tokens.get("completion_expert_probs")),
             advantage=None,
         )
         rollouts.append(rollout)

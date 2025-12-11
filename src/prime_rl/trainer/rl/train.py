@@ -227,20 +227,47 @@ def train(config: RLTrainerConfig):
             loss_mask = micro_batch["loss_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             temperature = micro_batch["temperature"]
+            moe_routing_overrides = micro_batch.get("moe_routing_overrides")
+            use_router_is = moe_routing_overrides is not None
 
             # Forward pass
             with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
-                logits = forward(model, input_ids, position_ids).float().contiguous()
+                logits, trainer_router_logprobs_layers = forward(
+                    model,
+                    input_ids,
+                    position_ids,
+                    moe_routing_overrides=moe_routing_overrides,
+                    return_router_logprobs=use_router_is,
+                )
+                logits = logits.float().contiguous()
 
             shifted_logits = shift_logits(logits)
             shifted_logits = shifted_logits / temperature
-            trainer_logprobs = selective_log_softmax(shifted_logits, input_ids)
+            trainer_token_logprobs = selective_log_softmax(shifted_logits, input_ids)
+
+            trainer_logprobs_for_loss = trainer_token_logprobs
+            inference_logprobs_for_loss = inference_logprobs
+
+            if use_router_is and trainer_router_logprobs_layers is not None:
+                trainer_router_logprobs = torch.zeros_like(trainer_token_logprobs)
+                for lp in trainer_router_logprobs_layers:
+                    trainer_router_logprobs = trainer_router_logprobs + lp.to(trainer_router_logprobs.device)
+
+                inference_router_logprobs = torch.zeros_like(trainer_router_logprobs)
+                for override in moe_routing_overrides.values():
+                    probs = override["probs"].to(inference_router_logprobs.device)
+                    if probs.dim() == 2:
+                        probs = probs.unsqueeze(0)
+                    inference_router_logprobs = inference_router_logprobs + torch.log(probs + 1e-20).sum(dim=-1)
+
+                trainer_logprobs_for_loss = trainer_token_logprobs + trainer_router_logprobs
+                inference_logprobs_for_loss = inference_logprobs + inference_router_logprobs
 
             # Compute loss
             response_lengths = get_response_lengths(position_ids)
             loss, loss_tensors = compute_loss(
-                trainer_logprobs=trainer_logprobs.squeeze().split(response_lengths),
-                inference_logprobs=inference_logprobs.squeeze().split(response_lengths),
+                trainer_logprobs=trainer_logprobs_for_loss.squeeze().split(response_lengths),
+                inference_logprobs=inference_logprobs_for_loss.squeeze().split(response_lengths),
                 advantages=advantages.squeeze().split(response_lengths),
                 loss_mask=loss_mask.squeeze().split(response_lengths),
                 loss_config=config.loss,
@@ -258,7 +285,7 @@ def train(config: RLTrainerConfig):
                 loss.backward()
 
             # Add relevant tensors to tensor dict for logging purposes
-            tensors["trainer_probs"].append(torch.exp(trainer_logprobs)[loss_mask].detach().to("cpu"))
+            tensors["trainer_probs"].append(torch.exp(trainer_token_logprobs)[loss_mask].detach().to("cpu"))
             tensors["inference_probs"].append(torch.exp(inference_logprobs)[loss_mask].detach().to("cpu"))
             tensors["entropy"].append(entropy[loss_mask].detach().to("cpu"))
             tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
