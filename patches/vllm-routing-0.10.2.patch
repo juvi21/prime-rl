@@ -1,0 +1,313 @@
+diff -ruN .tmp_vllm_clean2/vllm-0.10.2/vllm/entrypoints/openai/serving_chat.py .tmp_vllm/vllm-0.10.2/vllm/entrypoints/openai/serving_chat.py
+--- .tmp_vllm_clean2/vllm-0.10.2/vllm/entrypoints/openai/serving_chat.py	2025-09-13 21:17:37.000000000 +0200
++++ .tmp_vllm/vllm-0.10.2/vllm/entrypoints/openai/serving_chat.py	2025-12-11 20:52:48.038013664 +0100
+@@ -1516,6 +1516,7 @@
+                         top_logprobs=self._get_top_logprobs(
+                             step_top_logprobs, num_output_top_logprobs,
+                             tokenizer, should_return_as_token_id),
++                        experts=getattr(step_token, "experts", None),
+                     ))
+ 
+         return ChatCompletionLogProbs(content=logprobs_content)
+diff -ruN .tmp_vllm_clean2/vllm-0.10.2/vllm/logprobs.py .tmp_vllm/vllm-0.10.2/vllm/logprobs.py
+--- .tmp_vllm_clean2/vllm-0.10.2/vllm/logprobs.py	2025-09-13 21:17:37.000000000 +0200
++++ .tmp_vllm/vllm-0.10.2/vllm/logprobs.py	2025-12-11 20:52:07.160403150 +0100
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from dataclasses import dataclass
+-from typing import Optional
++from typing import Any, Optional
+ 
+ 
+ # We use dataclass for now because it is used for
+@@ -19,6 +19,8 @@
+     logprob: float
+     rank: Optional[int] = None
+     decoded_token: Optional[str] = None
++    # Optional MoE routing metadata (list per layer of {"ids","probs"}).
++    experts: Optional[Any] = None
+ 
+ 
+ # {token_id -> logprob} per each sequence group. None if the corresponding
+diff -ruN .tmp_vllm_clean2/vllm-0.10.2/vllm/model_executor/layers/fused_moe/layer.py .tmp_vllm/vllm-0.10.2/vllm/model_executor/layers/fused_moe/layer.py
+--- .tmp_vllm_clean2/vllm-0.10.2/vllm/model_executor/layers/fused_moe/layer.py	2025-09-13 21:17:37.000000000 +0200
++++ .tmp_vllm/vllm-0.10.2/vllm/model_executor/layers/fused_moe/layer.py	2025-12-11 21:06:17.980309635 +0100
+@@ -483,6 +483,20 @@
+             logical_to_physical_map=logical_to_physical_map,
+             logical_replica_count=logical_replica_count)
+ 
++        # Record routing decisions for replay / router-IS if enabled.
++        try:
++            from vllm.routing_recorder import routing_recorder
++            raw_topk_probs = topk_weights
++            if not enable_eplb:
++                if scoring_func == "sigmoid":
++                    full_probs = torch.sigmoid(router_logits.to(torch.float32))
++                else:
++                    full_probs = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
++                raw_topk_probs = full_probs.gather(dim=-1, index=topk_ids.long())
++            routing_recorder.record_layer(layer.layer_name, topk_ids, raw_topk_probs, topk_weights)
++        except Exception:
++            pass
++
+         if self.rocm_aiter_moe_enabled:
+             return self.rocm_aiter_fused_experts(
+                 hidden_states=x,
+diff -ruN .tmp_vllm_clean2/vllm-0.10.2/vllm/routing_recorder.py .tmp_vllm/vllm-0.10.2/vllm/routing_recorder.py
+--- .tmp_vllm_clean2/vllm-0.10.2/vllm/routing_recorder.py	1970-01-01 01:00:00.000000000 +0100
++++ .tmp_vllm/vllm-0.10.2/vllm/routing_recorder.py	2025-12-11 21:06:09.180393336 +0100
+@@ -0,0 +1,129 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Thread-local recorder for MoE routing decisions.
++
++This is used to expose per-token expert indices and probabilities in
++OpenAI-compatible logprobs outputs for routing replay + router IS.
++"""
++
++from __future__ import annotations
++
++import re
++import threading
++from dataclasses import dataclass, field
++from typing import Any, Optional
++
++import torch
++
++
++_LAYER_RE = re.compile(r"layers\.(\d+)")
++
++
++def _extract_layer_idx(layer_name: str) -> Optional[int]:
++    m = _LAYER_RE.search(layer_name)
++    if m is None:
++        return None
++    try:
++        return int(m.group(1))
++    except Exception:
++        return None
++
++
++@dataclass
++class _RoutingState:
++    req_ids: list[str] = field(default_factory=list)
++    num_tokens_per_req: list[int] = field(default_factory=list)
++    # Per request, list of per-token dict[layer_idx -> {"ids","probs"}]
++    current_tokens: dict[str, list[dict[int, dict[str, Any]]]] = field(
++        default_factory=dict
++    )
++
++
++class RoutingRecorder:
++    """Global routing recorder.
++
++    We use a thread-local "current" state to split the batched top-k routing
++    outputs into per-request slices. Per-request histories are accumulated in
++    `history` and consumed by logprobs processing.
++    """
++
++    def __init__(self) -> None:
++        self._tls = threading.local()
++        self.history: dict[str, list[dict[int, dict[str, Any]]]] = {}
++
++    def start(self, req_ids: list[str], num_tokens_per_req: list[int]) -> None:
++        state = _RoutingState(req_ids=req_ids, num_tokens_per_req=num_tokens_per_req)
++        state.current_tokens = {
++            rid: [dict() for _ in range(n)] for rid, n in zip(req_ids, num_tokens_per_req)
++        }
++        self._tls.state = state
++
++    def record_layer(
++        self,
++        layer_name: str,
++        topk_ids: torch.Tensor,
++        topk_probs: torch.Tensor,
++        topk_weights: torch.Tensor | None = None,
++    ) -> None:
++        state: _RoutingState | None = getattr(self._tls, "state", None)
++        if state is None or not state.req_ids:
++            return
++        layer_idx = _extract_layer_idx(layer_name)
++        if layer_idx is None:
++            return
++
++        # Ensure CPU lists for storage.
++        ids_list = topk_ids.detach().to("cpu").tolist()
++        probs_list = topk_probs.detach().to("cpu").tolist()
++        weights_list = (
++            None
++            if topk_weights is None
++            else topk_weights.detach().to("cpu").tolist()
++        )
++
++        offset = 0
++        for rid, n_tok in zip(state.req_ids, state.num_tokens_per_req):
++            if n_tok <= 0:
++                continue
++            per_req_ids = ids_list[offset : offset + n_tok]
++            per_req_probs = probs_list[offset : offset + n_tok]
++            for i in range(n_tok):
++                entry = {"ids": per_req_ids[i], "probs": per_req_probs[i]}
++                if weights_list is not None:
++                    entry["weights"] = weights_list[offset + i]
++                state.current_tokens[rid][i][layer_idx] = entry
++            offset += n_tok
++
++    def finish(self) -> None:
++        state: _RoutingState | None = getattr(self._tls, "state", None)
++        if state is None:
++            return
++        for rid in state.req_ids:
++            if rid not in self.history:
++                self.history[rid] = []
++            self.history[rid].extend(state.current_tokens.get(rid, []))
++        self._tls.state = None
++
++    def pop(self, request_id: str, n: int) -> Optional[list[list[dict[str, Any]]]]:
++        """Pop next n positions' experts for request_id.
++
++        Returns a list of length n, each element a list of layer entries sorted
++        by layer_idx.
++        """
++        hist = self.history.get(request_id)
++        if not hist or n <= 0:
++            return None
++        out = hist[:n]
++        self.history[request_id] = hist[n:]
++        if not self.history[request_id]:
++            self.history.pop(request_id, None)
++
++        # Convert dict[layer_idx->entry] to sorted list per position.
++        sorted_out: list[list[dict[str, Any]]] = []
++        for pos_dict in out:
++            layers = [pos_dict[k] for k in sorted(pos_dict.keys())]
++            sorted_out.append(layers)
++        return sorted_out
++
++
++routing_recorder = RoutingRecorder()
+diff -ruN .tmp_vllm_clean2/vllm-0.10.2/vllm/v1/engine/logprobs.py .tmp_vllm/vllm-0.10.2/vllm/v1/engine/logprobs.py
+--- .tmp_vllm_clean2/vllm-0.10.2/vllm/v1/engine/logprobs.py	2025-09-13 21:17:37.000000000 +0200
++++ .tmp_vllm/vllm-0.10.2/vllm/v1/engine/logprobs.py	2025-12-11 20:52:32.668159851 +0100
+@@ -31,6 +31,8 @@
+     cumulative_logprob: Optional[float]
+     num_logprobs: Optional[int]
+     num_prompt_logprobs: Optional[int]
++    # Current request id for routing metadata lookup.
++    request_id: Optional[str] = None
+ 
+     @classmethod
+     def from_new_request(
+@@ -79,15 +81,24 @@
+             sampled_token_logprob = logprobs[0]
+             self.cumulative_logprob += sampled_token_logprob
+ 
+-            # Update with the Logprob dictionary for this pos.
+-            self.logprobs.append(
+-                self._make_logprob_dict(
+-                    logprobs,
+-                    token_ids,
+-                    decoded_tokens,
+-                    rank,
+-                    self.num_logprobs,
+-                ))
++            logprob_dict = self._make_logprob_dict(
++                logprobs,
++                token_ids,
++                decoded_tokens,
++                rank,
++                self.num_logprobs,
++            )
++            # Attach routing metadata if available.
++            if self.request_id is not None:
++                try:
++                    from vllm.routing_recorder import routing_recorder
++                    experts = routing_recorder.pop(self.request_id, 1)
++                    if experts is not None:
++                        for lp in logprob_dict.values():
++                            lp.experts = experts[0]
++                except Exception:
++                    pass
++            self.logprobs.append(logprob_dict)
+ 
+     def _update_prompt_logprobs(
+         self,
+@@ -121,6 +132,15 @@
+         prompt_logprobs = logprobs.tolist()
+         token_ids = token_ids.tolist()
+ 
++        # Fetch routing metadata for prompt positions if available.
++        prompt_experts = None
++        if self.request_id is not None:
++            try:
++                from vllm.routing_recorder import routing_recorder
++                prompt_experts = routing_recorder.pop(self.request_id, num_prompt_tokens)
++            except Exception:
++                prompt_experts = None
++
+         # Make Logprob for each position.
+         for pos in range(num_prompt_tokens):
+             # Handle flattening.
+@@ -129,12 +149,17 @@
+             decoded_tokens_for_pos = NONES \
+             if decoded_tokens is None else decoded_tokens[offset:offset_end]
+ 
+-            # Update with the Logprob dictionary for this pos.
+-            self.prompt_logprobs.append(
+-                self._make_logprob_dict(prompt_logprobs[pos], token_ids[pos],
+-                                        decoded_tokens_for_pos,
+-                                        prompt_token_ranks[pos],
+-                                        self.num_prompt_logprobs))
++            logprob_dict = self._make_logprob_dict(
++                prompt_logprobs[pos],
++                token_ids[pos],
++                decoded_tokens_for_pos,
++                prompt_token_ranks[pos],
++                self.num_prompt_logprobs,
++            )
++            if prompt_experts is not None and pos < len(prompt_experts):
++                for lp in logprob_dict.values():
++                    lp.experts = prompt_experts[pos]
++            self.prompt_logprobs.append(logprob_dict)
+ 
+     def pop_prompt_logprobs(self) -> Optional[PromptLogprobs]:
+         """Pop and return all request prompt logprobs
+@@ -195,6 +220,7 @@
+         }
+ 
+     def update_from_output(self, output: EngineCoreOutput) -> None:
++        self.request_id = output.request_id
+         if output.new_logprobs is not None:
+             self._update_sample_logprobs(output.new_logprobs)
+         if output.new_prompt_logprobs_tensors is not None:
+diff -ruN .tmp_vllm_clean2/vllm-0.10.2/vllm/v1/worker/gpu_model_runner.py .tmp_vllm/vllm-0.10.2/vllm/v1/worker/gpu_model_runner.py
+--- .tmp_vllm_clean2/vllm-0.10.2/vllm/v1/worker/gpu_model_runner.py	2025-09-13 21:17:37.000000000 +0200
++++ .tmp_vllm/vllm-0.10.2/vllm/v1/worker/gpu_model_runner.py	2025-12-11 20:51:59.853472877 +0100
+@@ -885,6 +885,13 @@
+         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+         max_num_scheduled_tokens = max(tokens)
+ 
++        # Initialize routing recorder for this batch.
++        try:
++            from vllm.routing_recorder import routing_recorder
++            routing_recorder.start(list(req_ids), tokens)
++        except Exception:
++            pass
++
+         # Get request indices.
+         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+         req_indices = np.repeat(self.arange_np[:num_reqs],
+@@ -2068,6 +2075,12 @@
+                 inputs_embeds=inputs_embeds,
+                 **model_kwargs,
+             )
++            # Finalize routing records for this forward.
++            try:
++                from vllm.routing_recorder import routing_recorder
++                routing_recorder.finish()
++            except Exception:
++                pass
+ 
+         with record_function_or_nullcontext("Postprocess"):
+             if self.use_aux_hidden_state_outputs:
